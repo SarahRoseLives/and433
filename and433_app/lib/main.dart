@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -41,6 +42,29 @@ class _DecoderPageState extends State<DecoderPage> {
   String _status = 'Stopped';
   final List<Map<String, dynamic>> _packets = [];
   StreamSubscription<Map<String, dynamic>>? _sub;
+
+  // Search & filter state
+  String _searchQuery = '';
+  final Set<String> _selectedModels = {};
+
+  List<Map<String, dynamic>> get _filteredPackets {
+    final query = _searchQuery.toLowerCase();
+    return _packets.where((p) {
+      final matchesModel = _selectedModels.isEmpty ||
+          _selectedModels.contains(p['model'] as String? ?? 'Unknown');
+      final matchesSearch = query.isEmpty ||
+          jsonEncode(p).toLowerCase().contains(query);
+      return matchesModel && matchesSearch;
+    }).toList();
+  }
+
+  List<String> get _uniqueModels {
+    final seen = <String>{};
+    return _packets
+        .map((p) => p['model'] as String? ?? 'Unknown')
+        .where(seen.add)
+        .toList();
+  }
 
   Future<void> _start() async {
     setState(() {
@@ -130,14 +154,65 @@ class _DecoderPageState extends State<DecoderPage> {
       ),
       body: Column(
         children: [
+          // ── Search bar ─────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: 'Search packets…',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () => setState(() => _searchQuery = ''),
+                      )
+                    : null,
+                isDense: true,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(24),
+                ),
+              ),
+              onChanged: (v) => setState(() => _searchQuery = v),
+            ),
+          ),
+          // ── Device filter chips ────────────────────────────────────────
+          if (_uniqueModels.isNotEmpty)
+            SizedBox(
+              height: 40,
+              child: ListView(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                scrollDirection: Axis.horizontal,
+                children: _uniqueModels.map((model) {
+                  final selected = _selectedModels.contains(model);
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: FilterChip(
+                      label: Text(model),
+                      selected: selected,
+                      onSelected: (on) => setState(() {
+                        if (on) {
+                          _selectedModels.add(model);
+                        } else {
+                          _selectedModels.remove(model);
+                        }
+                      }),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
           // ── Decoded packets ────────────────────────────────────────────
           Expanded(
-            child: _packets.isEmpty
-                ? const Center(child: Text('No packets decoded yet.'))
+            child: _filteredPackets.isEmpty
+                ? Center(
+                    child: Text(_packets.isEmpty
+                        ? 'No packets decoded yet.'
+                        : 'No packets match filters.'),
+                  )
                 : ListView.builder(
-                    itemCount: _packets.length,
+                    itemCount: _filteredPackets.length,
                     itemBuilder: (context, index) {
-                      final p = _packets[index];
+                      final p = _filteredPackets[index];
                       final model = p['model'] as String? ?? 'Unknown';
                       final time = p['time'] as String? ?? '';
                       return ListTile(
