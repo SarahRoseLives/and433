@@ -54,6 +54,12 @@ class _DecoderPageState extends State<DecoderPage> {
   double _gainDb = 40.0; // 0.0 = AGC
   bool _biasT = false;
 
+  // Auto-upload state
+  final List<Map<String, dynamic>> _uploadQueue = [];
+  Timer? _uploadTimer;
+  _UploadStatus _uploadStatus = _UploadStatus.idle;
+  String? _uploadError; // set when token expired / persistent error
+
   List<Map<String, dynamic>> get _filteredPackets {
     final query = _searchQuery.toLowerCase();
     return _packets.where((p) {
@@ -100,6 +106,8 @@ class _DecoderPageState extends State<DecoderPage> {
             _packets.insert(0, packet);
             if (_packets.length > 200) _packets.removeLast();
           });
+          // Queue for auto-upload (only if no persistent auth error)
+          if (_uploadError == null) _uploadQueue.add(Map.of(packet));
         },
         onError: (Object e) {
           setState(() {
@@ -118,7 +126,9 @@ class _DecoderPageState extends State<DecoderPage> {
       setState(() {
         _isRunning = true;
         _status = 'Decoding…';
+        _uploadError = null;
       });
+      _startUploadTimer();
     } on PlatformException catch (e) {
       setState(() => _status = 'USB error: ${e.message}');
     } catch (e) {
@@ -127,6 +137,9 @@ class _DecoderPageState extends State<DecoderPage> {
   }
 
   Future<void> _stop() async {
+    _uploadTimer?.cancel();
+    _uploadTimer = null;
+    await _flushUploadQueue(); // final flush on stop
     setState(() => _status = 'Stopping…');
     await _sub?.cancel();
     _sub = null;
@@ -141,9 +154,52 @@ class _DecoderPageState extends State<DecoderPage> {
 
   @override
   void dispose() {
+    _uploadTimer?.cancel();
     _sub?.cancel();
     Rtl433Plugin.instance.stopDecoding();
     super.dispose();
+  }
+
+  void _startUploadTimer() {
+    _uploadTimer?.cancel();
+    _uploadTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _flushUploadQueue();
+    });
+  }
+
+  Future<void> _flushUploadQueue() async {
+    if (_uploadQueue.isEmpty) return;
+    final token = await Api433MapService.instance.savedToken();
+    if (token == null) return; // not logged in — silent skip
+
+    final batch = List<Map<String, dynamic>>.from(_uploadQueue);
+    _uploadQueue.clear();
+
+    if (!mounted) return;
+    setState(() => _uploadStatus = _UploadStatus.uploading);
+
+    final content = CaptureExporter.buildA433(batch, _freqHz);
+    final error = await Api433MapService.instance.ingest(content);
+
+    if (!mounted) return;
+    if (error == null) {
+      setState(() => _uploadStatus = _UploadStatus.ok);
+    } else {
+      // Put packets back so they are retried next cycle (unless auth error)
+      final isAuthError = error.contains('log in again') ||
+          error.contains('Not logged in');
+      if (isAuthError) {
+        setState(() {
+          _uploadStatus = _UploadStatus.error;
+          _uploadError = error;
+          _uploadTimer?.cancel();
+          _uploadTimer = null;
+        });
+      } else {
+        _uploadQueue.insertAll(0, batch); // retry next flush
+        setState(() => _uploadStatus = _UploadStatus.error);
+      }
+    }
   }
 
   Future<void> _showExportDialog() async {
@@ -328,6 +384,35 @@ class _DecoderPageState extends State<DecoderPage> {
         title: const Text('And433 – RF Decoder'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          // Upload status indicator (shown while running and logged in)
+          if (_isRunning)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: switch (_uploadStatus) {
+                _UploadStatus.uploading => const Tooltip(
+                    message: 'Uploading to 433map.com…',
+                    child: Padding(
+                      padding: EdgeInsets.all(12),
+                      child: SizedBox(
+                        width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ),
+                _UploadStatus.ok => const Tooltip(
+                    message: 'Uploaded to 433map.com',
+                    child: Icon(Icons.cloud_done, color: Colors.green),
+                  ),
+                _UploadStatus.error => Tooltip(
+                    message: _uploadError ?? 'Upload error — will retry',
+                    child: const Icon(Icons.cloud_off, color: Colors.orange),
+                  ),
+                _UploadStatus.idle => const Tooltip(
+                    message: 'Auto-upload active',
+                    child: Icon(Icons.cloud_upload_outlined),
+                  ),
+              },
+            ),
           if (_packets.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.upload_file),
@@ -347,6 +432,29 @@ class _DecoderPageState extends State<DecoderPage> {
       ),
       body: Column(
         children: [
+          // ── Auth error banner ──────────────────────────────────────────
+          if (_uploadError != null)
+            MaterialBanner(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              content: Text(_uploadError!),
+              leading: const Icon(Icons.cloud_off, color: Colors.orange),
+              actions: [
+                TextButton(
+                  onPressed: () async {
+                    final ok = await _showLoginDialog();
+                    if (ok && mounted) {
+                      setState(() { _uploadError = null; _uploadStatus = _UploadStatus.idle; });
+                      _startUploadTimer();
+                    }
+                  },
+                  child: const Text('Log in'),
+                ),
+                TextButton(
+                  onPressed: () => setState(() => _uploadError = null),
+                  child: const Text('Dismiss'),
+                ),
+              ],
+            ),
           // ── SDR settings (shown when stopped) ─────────────────────────
           if (!_isRunning)
             Card(
@@ -479,3 +587,4 @@ class _DecoderPageState extends State<DecoderPage> {
     );
   }
 }
+enum _UploadStatus { idle, uploading, ok, error }
