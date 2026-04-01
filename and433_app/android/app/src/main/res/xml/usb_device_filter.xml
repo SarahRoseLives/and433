@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Realtek RTL2832U — vendor ID 3034 (0x0BDA).
+        Covers all common RTL-SDR dongles (R820T, R828D, FC0013, etc.).
+        Android will prompt the user to grant USB permission when the dongle
+        is plugged in, and will auto-launch And433 if it isn't already running.
+    -->
+    <usb-device vendor-id="3034" />
+</resources>

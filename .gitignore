@@ -1,0 +1,28 @@
+# Build outputs
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/pubspec.lock
+*.class
+*.o
+*.so
+*.a
+*.d
+*.obj
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Android local
+and433_app/android/local.properties
+and433_app/android/.gradle/
+
+# Large generated/binary files we don't need in git
+and433_app/android/app/src/main/cpp/
+
+# rtl_tcp_andro is a submodule reference, not full source
+# (keep it for now since CMakeLists references it)
