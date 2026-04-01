@@ -32,6 +32,8 @@ class Rtl433Plugin {
     required String devQuery,
     int freqHz = 433920000,
     int sampleRate = 250000,
+    String? gainStr,   // null = AGC; "40" = 40 dB etc.
+    bool biasT = false,
   }) {
     if (_running) throw StateError('Already decoding. Call stopDecoding() first.');
 
@@ -70,11 +72,16 @@ class Rtl433Plugin {
     );
 
     final devQueryPtr = devQuery.toNativeUtf8(allocator: malloc);
+    final gainStrPtr = (gainStr != null && gainStr.isNotEmpty)
+        ? gainStr.toNativeUtf8(allocator: malloc)
+        : ''.toNativeUtf8(allocator: malloc);
     try {
       final rc = Rtl433FfiBindings.instance.start(
         devQueryPtr,
         freqHz,
         sampleRate,
+        gainStrPtr,
+        biasT ? 1 : 0,
         _nativeCallback!.nativeFunction,
         nullptr,
       );
@@ -84,6 +91,7 @@ class Rtl433Plugin {
       }
     } finally {
       malloc.free(devQueryPtr);
+      malloc.free(gainStrPtr);
     }
 
     _running = true;

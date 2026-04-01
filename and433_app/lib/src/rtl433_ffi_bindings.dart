@@ -23,6 +23,8 @@ typedef Rtl433StartNative = Int32 Function(
   Pointer<Utf8> devQuery,
   Uint32 freqHz,
   Uint32 sampleRate,
+  Pointer<Utf8> gainStr,
+  Int32 biasT,
   Pointer<NativeFunction<Rtl433DataCbNative>> cb,
   Pointer<Void> ctx,
 );
@@ -30,6 +32,8 @@ typedef Rtl433StartDart = int Function(
   Pointer<Utf8> devQuery,
   int freqHz,
   int sampleRate,
+  Pointer<Utf8> gainStr,
+  int biasT,
   Pointer<NativeFunction<Rtl433DataCbNative>> cb,
   Pointer<Void> ctx,
 );

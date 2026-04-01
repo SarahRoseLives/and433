@@ -49,6 +49,10 @@ class _DecoderPageState extends State<DecoderPage> {
   String _searchQuery = '';
   final Set<String> _selectedModels = {};
 
+  // SDR settings
+  double _gainDb = 40.0; // 0.0 = AGC
+  bool _biasT = false;
+
   List<Map<String, dynamic>> get _filteredPackets {
     final query = _searchQuery.toLowerCase();
     return _packets.where((p) {
@@ -84,6 +88,8 @@ class _DecoderPageState extends State<DecoderPage> {
         devQuery: devQuery,
         freqHz: _freqHz,
         sampleRate: _sampleRate,
+        gainStr: _gainDb == 0.0 ? null : _gainDb.toStringAsFixed(1),
+        biasT: _biasT,
       );
 
       _sub = stream.listen(
@@ -204,6 +210,48 @@ class _DecoderPageState extends State<DecoderPage> {
       ),
       body: Column(
         children: [
+          // ── SDR settings (shown when stopped) ─────────────────────────
+          if (!_isRunning)
+            Card(
+              margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _gainDb == 0.0
+                                ? 'Gain: AGC (automatic)'
+                                : 'Gain: ${_gainDb.toStringAsFixed(1)} dB',
+                            style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: _gainDb,
+                      min: 0.0,
+                      max: 49.6,
+                      divisions: 496,
+                      label: _gainDb == 0.0
+                          ? 'AGC'
+                          : '${_gainDb.toStringAsFixed(1)} dB',
+                      onChanged: (v) => setState(() => _gainDb = v),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Bias-T (5V antenna supply)'),
+                      subtitle: const Text('RTL-SDR Blog V3/V4 only'),
+                      value: _biasT,
+                      onChanged: (v) => setState(() => _biasT = v),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           // ── Search bar ─────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
