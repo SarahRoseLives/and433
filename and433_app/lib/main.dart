@@ -40,9 +40,7 @@ class _DecoderPageState extends State<DecoderPage> {
   bool _isRunning = false;
   String _status = 'Stopped';
   final List<Map<String, dynamic>> _packets = [];
-  final List<String> _logs = [];
   StreamSubscription<Map<String, dynamic>>? _sub;
-  StreamSubscription<String>? _logSub;
 
   Future<void> _start() async {
     setState(() {
@@ -51,8 +49,6 @@ class _DecoderPageState extends State<DecoderPage> {
     });
 
     try {
-      // Get a native USB file descriptor from Android's UsbManager.
-      // Returns "fd:N:/dev/bus/usb/XXX/YYY" for rtl433_ffi_start.
       final devQuery = await UsbHelper.instance.openDevice();
 
       setState(() => _status = 'Starting decoder…');
@@ -62,13 +58,6 @@ class _DecoderPageState extends State<DecoderPage> {
         freqHz: _freqHz,
         sampleRate: _sampleRate,
       );
-
-      _logSub = Rtl433Plugin.instance.logStream.listen((line) {
-        setState(() {
-          _logs.insert(0, line);
-          if (_logs.length > 100) _logs.removeLast();
-        });
-      });
 
       _sub = stream.listen(
         (packet) {
@@ -104,8 +93,6 @@ class _DecoderPageState extends State<DecoderPage> {
 
   Future<void> _stop() async {
     setState(() => _status = 'Stopping…');
-    await _logSub?.cancel();
-    _logSub = null;
     await _sub?.cancel();
     _sub = null;
     await Rtl433Plugin.instance.stopDecoding();
@@ -118,7 +105,6 @@ class _DecoderPageState extends State<DecoderPage> {
 
   @override
   void dispose() {
-    _logSub?.cancel();
     _sub?.cancel();
     Rtl433Plugin.instance.stopDecoding();
     super.dispose();
@@ -144,39 +130,6 @@ class _DecoderPageState extends State<DecoderPage> {
       ),
       body: Column(
         children: [
-          // ── Diagnostics log (collapsible) ──────────────────────────────
-          if (_isRunning || _logs.isNotEmpty)
-            ExpansionTile(
-              title: Text('Diagnostics (${_logs.length})',
-                  style: Theme.of(context).textTheme.bodySmall),
-              initiallyExpanded: _packets.isEmpty,
-              children: [
-                SizedBox(
-                  height: 160,
-                  child: _logs.isEmpty
-                      ? const Center(
-                          child: Text('Waiting for log messages…',
-                              style: TextStyle(fontSize: 12, color: Colors.grey)))
-                      : ListView.builder(
-                    reverse: true,
-                    itemCount: _logs.length,
-                    itemBuilder: (_, i) => Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
-                      child: Text(_logs[i],
-                          style: TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 11,
-                            color: _logs[i].contains('ERROR') || _logs[i].contains('CRIT')
-                                ? Colors.red
-                                : _logs[i].contains('WARN')
-                                    ? Colors.orange
-                                    : null,
-                          )),
-                    ),
-                  ),
-                ),
-              ],
-            ),
           // ── Decoded packets ────────────────────────────────────────────
           Expanded(
             child: _packets.isEmpty
