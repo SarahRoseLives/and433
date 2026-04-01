@@ -1,6 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Internet permission kept for rtl_tcp fallback mode -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- GPS location for tagging captures -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <!-- USB host — app accesses RTL-SDR dongle directly via OTG cable -->
     <uses-feature android:name="android.hardware.usb.host" android:required="true"/>
     <application

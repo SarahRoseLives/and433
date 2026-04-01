@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'src/capture_exporter.dart';
+import 'src/gps_service.dart';
 import 'src/rtl433_plugin.dart';
 import 'src/sdr_intent_launcher.dart'; // now UsbHelper
 
@@ -73,6 +75,7 @@ class _DecoderPageState extends State<DecoderPage> {
     });
 
     try {
+      await GpsService.instance.start(); // best-effort; no GPS = no tags
       final devQuery = await UsbHelper.instance.openDevice();
 
       setState(() => _status = 'Starting decoder…');
@@ -85,6 +88,7 @@ class _DecoderPageState extends State<DecoderPage> {
 
       _sub = stream.listen(
         (packet) {
+          GpsService.instance.inject(packet);
           setState(() {
             _packets.insert(0, packet);
             if (_packets.length > 200) _packets.removeLast();
@@ -121,6 +125,7 @@ class _DecoderPageState extends State<DecoderPage> {
     _sub = null;
     await Rtl433Plugin.instance.stopDecoding();
     await UsbHelper.instance.closeDevice();
+    GpsService.instance.stop();
     setState(() {
       _isRunning = false;
       _status = 'Stopped';
@@ -134,6 +139,45 @@ class _DecoderPageState extends State<DecoderPage> {
     super.dispose();
   }
 
+  Future<void> _showExportDialog() async {
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Export captures as…'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'a433'),
+            child: const ListTile(
+              leading: Icon(Icons.data_object),
+              title: Text('.a433  (JSONL — full data)'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'kml'),
+            child: const ListTile(
+              leading: Icon(Icons.map),
+              title: Text('.kml  (Google Earth / Maps)'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (choice == null) return;
+    try {
+      if (choice == 'a433') {
+        await CaptureExporter.exportA433(_packets, _freqHz);
+      } else {
+        await CaptureExporter.exportKml(_packets);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Export failed: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -141,6 +185,12 @@ class _DecoderPageState extends State<DecoderPage> {
         title: const Text('And433 – RF Decoder'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          if (_packets.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.upload_file),
+              tooltip: 'Export',
+              onPressed: _showExportDialog,
+            ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Center(
