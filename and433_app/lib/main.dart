@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'src/api_433map.dart';
 import 'src/capture_exporter.dart';
 import 'src/gps_service.dart';
 import 'src/rtl433_plugin.dart';
@@ -149,7 +150,7 @@ class _DecoderPageState extends State<DecoderPage> {
     final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => SimpleDialog(
-        title: const Text('Export captures as…'),
+        title: const Text('Export / Upload captures'),
         children: [
           SimpleDialogOption(
             onPressed: () => Navigator.pop(ctx, 'a433'),
@@ -165,6 +166,14 @@ class _DecoderPageState extends State<DecoderPage> {
               title: Text('.kml  (Google Earth / Maps)'),
             ),
           ),
+          const Divider(),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'upload'),
+            child: const ListTile(
+              leading: Icon(Icons.cloud_upload),
+              title: Text('Upload to 433map.com'),
+            ),
+          ),
         ],
       ),
     );
@@ -172,8 +181,10 @@ class _DecoderPageState extends State<DecoderPage> {
     try {
       if (choice == 'a433') {
         await CaptureExporter.exportA433(_packets, _freqHz);
-      } else {
+      } else if (choice == 'kml') {
         await CaptureExporter.exportKml(_packets);
+      } else if (choice == 'upload') {
+        await _uploadTo433Map();
       }
     } catch (e) {
       if (mounted) {
@@ -182,6 +193,132 @@ class _DecoderPageState extends State<DecoderPage> {
         );
       }
     }
+  }
+
+  Future<void> _uploadTo433Map() async {
+    // Ensure we have a token — show login if not
+    var token = await Api433MapService.instance.savedToken();
+    if (token == null) {
+      if (!mounted) return;
+      final loggedIn = await _showLoginDialog();
+      if (!loggedIn) return;
+    }
+
+    if (!mounted) return;
+    // Show uploading indicator
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Row(children: [
+          SizedBox(
+            width: 18, height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+          ),
+          SizedBox(width: 12),
+          Text('Uploading to 433map.com…'),
+        ]),
+        duration: Duration(seconds: 30),
+      ),
+    );
+
+    final content = CaptureExporter.buildA433(_packets, _freqHz);
+    final error = await Api433MapService.instance.ingest(content);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    if (error == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✓ Uploaded to 433map.com')),
+      );
+    } else {
+      // If session expired, offer re-login
+      final expired = error.contains('log in again');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(error),
+          action: expired
+              ? SnackBarAction(label: 'Log in', onPressed: _uploadTo433Map)
+              : null,
+        ),
+      );
+    }
+  }
+
+  /// Shows login dialog. Returns true if login succeeded.
+  Future<bool> _showLoginDialog({String? initialError}) async {
+    final usernameCtrl = TextEditingController(
+        text: await Api433MapService.instance.savedUsername() ?? '');
+    final passwordCtrl = TextEditingController();
+    String? errorMsg = initialError;
+    bool loading = false;
+
+    if (!mounted) return false;
+    // ignore: use_build_context_synchronously
+    final dialogCtx = context;
+    return await showDialog<bool>(
+          context: dialogCtx,
+          barrierDismissible: false,
+          builder: (ctx) => StatefulBuilder(
+            builder: (ctx, setS) => AlertDialog(
+              title: const Text('Log in to 433map.com'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (errorMsg != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(errorMsg!,
+                          style: TextStyle(
+                              color: Theme.of(ctx).colorScheme.error,
+                              fontSize: 13)),
+                    ),
+                  TextField(
+                    controller: usernameCtrl,
+                    decoration: const InputDecoration(labelText: 'Username'),
+                    autofillHints: const [AutofillHints.username],
+                    textInputAction: TextInputAction.next,
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: passwordCtrl,
+                    decoration: const InputDecoration(labelText: 'Password'),
+                    obscureText: true,
+                    autofillHints: const [AutofillHints.password],
+                    textInputAction: TextInputAction.done,
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: loading ? null : () => Navigator.pop(ctx, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: loading
+                      ? null
+                      : () async {
+                          setS(() { loading = true; errorMsg = null; });
+                          final err = await Api433MapService.instance.login(
+                            usernameCtrl.text.trim(),
+                            passwordCtrl.text,
+                          );
+                          if (err == null) {
+                            if (ctx.mounted) Navigator.pop(ctx, true);
+                          } else {
+                            setS(() { loading = false; errorMsg = err; });
+                          }
+                        },
+                  child: loading
+                      ? const SizedBox(
+                          width: 18, height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('Log in'),
+                ),
+              ],
+            ),
+          ),
+        ) ??
+        false;
   }
 
   @override
