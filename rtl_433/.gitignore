@@ -1,0 +1,31 @@
+# CMake out-of-tree builds
+build*/
+
+# IDE files
+.cproject
+.settings
+.project
+.cache
+.vs
+.idea
+cmake-build-debug/
+
+# Editor files
+*.orig
+*.bak
+*~
+*.tlog
+*.ipdb
+*.iobj
+*.idb
+*.lastbuildstate
+*.db
+*.opendb
+
+# Development files
+/_*/
+/rtl_433_tests
+
+# File manager files
+.DS_Store
+.history

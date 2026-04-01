@@ -1,0 +1,1479 @@
+/** @file
+    rtl_433, turns your Realtek RTL2832 based DVB dongle into a 433.92MHz generic data receiver.
+
+    Copyright (C) 2012 by Benjamin Larsson <benjamin@southpole.se>
+
+    Based on rtl_sdr
+    Copyright (C) 2012 by Steve Markgraf <steve@steve-m.de>
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+
+#include "rtl_433.h"
+#include "r_private.h"
+#include "r_device.h"
+#include "r_api.h"
+#include "sdr.h"
+#include "baseband.h"
+#include "pulse_analyzer.h"
+#include "pulse_detect.h"
+#include "pulse_detect_fsk.h"
+#include "pulse_slicer.h"
+#include "rfraw.h"
+#include "data.h"
+#include "raw_output.h"
+#include "r_util.h"
+#include "optparse.h"
+#include "abuf.h"
+#include "fileformat.h"
+#include "samp_grab.h"
+#include "am_analyze.h"
+#include "confparse.h"
+#include "term_ctl.h"
+#include "compat_paths.h"
+#include "logger.h"
+#include "fatal.h"
+#include "write_sigrok.h"
+#include "mongoose.h"
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#ifdef _MSC_VER
+#define F_OK 0
+#endif
+#endif
+#ifndef _MSC_VER
+#include <unistd.h>
+#endif
+
+#ifndef _MSC_VER
+#include <getopt.h>
+#else
+#include "getopt/getopt.h"
+#endif
+
+// note that Clang has _Noreturn but it's C11
+// #if defined(__clang__) ...
+#if !defined _Noreturn
+#if defined(__GNUC__)
+#define _Noreturn __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#define _Noreturn __declspec(noreturn)
+#else
+#define _Noreturn
+#endif
+#endif
+
+// STDERR_FILENO is not defined in at least MSVC
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#define usleep(us) Sleep((us) / 1000)
+#endif
+
+typedef struct timeval delay_timer_t;
+
+static void delay_timer_init(delay_timer_t *delay_timer)
+{
+    // set to current wall clock
+    get_time_now(delay_timer);
+}
+
+static void delay_timer_wait(delay_timer_t *delay_timer, unsigned delay_us)
+{
+    // sync to wall clock
+    struct timeval now_tv;
+    get_time_now(&now_tv);
+
+    time_t elapsed_s  = now_tv.tv_sec - delay_timer->tv_sec;
+    time_t elapsed_us = 1000000 * elapsed_s + now_tv.tv_usec - delay_timer->tv_usec;
+
+    // set next wanted start time
+    delay_timer->tv_usec += delay_us;
+    while (delay_timer->tv_usec > 1000000) {
+        delay_timer->tv_usec -= 1000000;
+        delay_timer->tv_sec += 1;
+    }
+
+    if ((time_t)delay_us > elapsed_us)
+        usleep(delay_us - elapsed_us);
+}
+
+r_device *flex_create_device(char *spec); // maybe put this in some header file?
+
+static void print_version(void)
+{
+    fprintf(stderr, "%s\n", version_string());
+}
+
+_Noreturn
+static void usage(int exit_code)
+{
+    term_help_fprintf(exit_code ? stderr : stdout,
+            "Generic RF data receiver and decoder for ISM band devices using RTL-SDR and SoapySDR.\n"
+            "Full documentation is available at https://triq.org/\n"
+            "\nUsage:\n"
+#ifdef _WIN32
+            "  A \"rtl_433.conf\" file is searched in the current dir, %%LocalAppData%%, %%ProgramData%%,\n"
+            "  e.g. \"C:\\Users\\username\\AppData\\Local\\rtl_433\\\", \"C:\\ProgramData\\rtl_433\\\",\n"
+            "  then command line args will be parsed in order.\n"
+#else
+            "  A \"rtl_433.conf\" file is searched in \"./\", XDG_CONFIG_HOME e.g. \"$HOME/.config/rtl_433/\",\n"
+            "  SYSCONFDIR e.g. \"/usr/local/etc/rtl_433/\", then command line args will be parsed in order.\n"
+#endif
+            "\t\t= General options =\n"
+            "  [-V] Output the version string and exit\n"
+            "  [-v] Increase verbosity (can be used multiple times).\n"
+            "       -v : verbose notice, -vv : verbose info, -vvv : debug, -vvvv : trace.\n"
+            "  [-c <path>] Read config options from a file\n"
+            "\t\t= Tuner options =\n"
+            "  [-d <RTL-SDR USB device index> | :<RTL-SDR USB device serial> | <SoapySDR device query> | rtl_tcp | help]\n"
+            "  [-g <gain> | help] (default: auto)\n"
+            "  [-t <settings>] apply a list of keyword=value settings to the SDR device\n"
+            "       e.g. for SoapySDR -t \"antenna=A,bandwidth=4.5M,rfnotch_ctrl=false\"\n"
+            "       for RTL-SDR use \"direct_samp[=1]\", \"offset_tune[=1]\", \"digital_agc[=1]\", \"biastee[=1]\"\n"
+            "  [-f <frequency>] Receive frequency(s) (default: %d Hz)\n"
+            "  [-H <seconds>] Hop interval for polling of multiple frequencies (default: %d seconds)\n"
+            "  [-p <ppm_error>] Correct rtl-sdr tuner frequency offset error (default: 0)\n"
+            "  [-s <sample rate>] Set sample rate (default: %d Hz)\n"
+            "  [-D quit | restart | pause | manual] Input device run mode options (default: quit).\n"
+            "\t\t= Demodulator options =\n"
+            "  [-R <device> | help] Enable only the specified device decoding protocol (can be used multiple times)\n"
+            "       Specify a negative number to disable a device decoding protocol (can be used multiple times)\n"
+            "  [-X <spec> | help] Add a general purpose decoder (prepend -R 0 to disable all decoders)\n"
+            "  [-Y auto | classic | minmax] FSK pulse detector mode.\n"
+            "  [-Y level=<dB level>] Manual detection level used to determine pulses (-1.0 to -30.0) (0=auto).\n"
+            "  [-Y minlevel=<dB level>] Manual minimum detection level used to determine pulses (-1.0 to -99.0).\n"
+            "  [-Y minsnr=<dB level>] Minimum SNR to determine pulses (1.0 to 99.0).\n"
+            "  [-Y autolevel] Set minlevel automatically based on average estimated noise.\n"
+            "  [-Y squelch] Skip frames below estimated noise level to reduce cpu load.\n"
+            "  [-Y ampest | magest] Choose amplitude or magnitude level estimator.\n"
+            "\t\t= Analyze/Debug options =\n"
+            "  [-A] Pulse Analyzer. Enable pulse analysis and decode attempt.\n"
+            "       Disable all decoders with -R 0 if you want analyzer output only.\n"
+            "  [-y <code>] Verify decoding of demodulated test data (e.g. \"{25}fb2dd58\") with enabled devices\n"
+            "\t\t= File I/O options =\n"
+            "  [-S none | all | unknown | known] Signal auto save. Creates one file per signal.\n"
+            "       Note: Saves raw I/Q samples (uint8 pcm, 2 channel). Preferred mode for generating test files.\n"
+            "  [-r <filename> | help] Read data from input file instead of a receiver\n"
+            "  [-w <filename> | help] Save data stream to output file (a '-' dumps samples to stdout)\n"
+            "  [-W <filename> | help] Save data stream to output file, overwrite existing file\n"
+            "\t\t= Data output options =\n"
+            "  [-F log | kv | json | csv | mqtt | influx | syslog | trigger | rtl_tcp | http | null | help] Produce decoded output in given format.\n"
+            "       Append output to file with :<filename> (e.g. -F csv:log.csv), defaults to stdout.\n"
+            "       Specify host/port for syslog with e.g. -F syslog:127.0.0.1:1514\n"
+            "  [-M time[:<options>] | protocol | level | noise[:<secs>] | stats | bits | help] Add various meta data to each output.\n"
+            "  [-K FILE | PATH | <tag> | <key>=<tag>] Add an expanded token or fixed tag to every output line.\n"
+            "  [-C native | si | customary] Convert units in decoded output.\n"
+            "  [-n <value>] Specify number of samples to take (each sample is an I/Q pair)\n"
+            "  [-T <seconds>] Specify number of seconds to run, also 12:34 or 1h23m45s\n"
+            "  [-E hop | quit] Hop/Quit after outputting successful event(s)\n"
+            "  [-h] Output this usage help and exit\n"
+            "       Use -d, -g, -R, -X, -F, -M, -r, -w, or -W without argument for more help\n\n",
+            DEFAULT_FREQUENCY, DEFAULT_HOP_TIME, DEFAULT_SAMPLE_RATE);
+    exit(exit_code);
+}
+
+_Noreturn
+static void help_protocols(r_device *devices, unsigned num_devices, int exit_code)
+{
+    unsigned i;
+    char disabledc;
+
+    if (devices) {
+        FILE *fp = exit_code ? stderr : stdout;
+        term_help_fprintf(fp,
+                "\t\t= Supported device protocols =\n");
+        for (i = 0; i < num_devices; i++) {
+            disabledc = devices[i].disabled ? '*' : ' ';
+            if (devices[i].disabled <= 2) // if not hidden
+                fprintf(fp, "    [%02u]%c %s\n", i + 1, disabledc, devices[i].name);
+        }
+        fprintf(fp, "\n* Disabled by default, use -R n or a conf file to enable\n");
+    }
+    exit(exit_code);
+}
+
+_Noreturn
+static void help_device_selection(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Input device selection =\n"
+#ifdef RTLSDR
+            "\tRTL-SDR device driver is available.\n"
+#else
+            "\tRTL-SDR device driver is not available.\n"
+#endif
+            "  [-d <RTL-SDR USB device index>] (default: 0)\n"
+            "  [-d :<RTL-SDR USB device serial (can be set with rtl_eeprom -s)>]\n"
+            "\tTo set gain for RTL-SDR use -g <gain> to set an overall gain in dB.\n"
+#ifdef SOAPYSDR
+            "\tSoapySDR device driver is available.\n"
+#else
+            "\tSoapySDR device driver is not available.\n"
+#endif
+            "  [-d \"\"] Open default SoapySDR device\n"
+            "  [-d driver=rtlsdr] Open e.g. specific SoapySDR device\n"
+            "\tTo set gain for SoapySDR use -g ELEM=val,ELEM=val,... e.g. -g LNA=20,TIA=8,PGA=2 (for LimeSDR).\n"
+            "  [-d rtl_tcp[:[//]host[:port]] (default: localhost:1234)\n"
+            "\tSpecify host/port to connect to with e.g. -d rtl_tcp:127.0.0.1:1234\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_gain(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Gain option =\n"
+            "  [-g <gain>] (default: auto)\n"
+            "\tFor RTL-SDR: gain in dB (\"0\" is auto).\n"
+            "\tFor SoapySDR: gain in dB for automatic distribution (\"\" is auto), or string of gain elements.\n"
+            "\tE.g. \"LNA=20,TIA=8,PGA=2\" for LimeSDR.\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_device_mode(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Input device run mode =\n"
+            "  [-D quit | restart | pause | manual] Input device run mode options (default: quit).\n"
+            "\tSupported input device run modes:\n"
+            "\t  quit: Quit on input device errors (default)\n"
+            "\t  restart: Restart the input device on errors\n"
+            "\t  pause: Pause the input device on errors, waits for e.g. HTTP-API control\n"
+            "\t  manual: Do not start an input device, waits for e.g. HTTP-API control\n"
+            "\tWithout this option the default is to start the SDR and quit on errors.\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_output(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Output format option =\n"
+            "  [-F log|kv|json|csv|mqtt|influx|syslog|trigger|rtl_tcp|http|null] Produce decoded output in given format.\n"
+            "\tWithout this option the default is LOG and KV output. Use \"-F null\" to remove the default.\n"
+            "\tAppend output to file with :<filename> (e.g. -F csv:log.csv), defaults to stdout.\n"
+            "  [-F mqtt[s][:[//]host[:port][,<options>]] (default: localhost:1883)\n"
+            "\tSpecify MQTT server with e.g. -F mqtt://localhost:1883\n"
+            "\tDefault user and password are read from MQTT_USERNAME and MQTT_PASSWORD env vars.\n"
+            "\tAdd MQTT options with e.g. -F \"mqtt://host:1883,opt=arg\"\n"
+            "\tMQTT options are: user=foo, pass=bar, retain[=0|1], <format>[=topic]\n"
+            "\tSupported MQTT formats: (default is all)\n"
+            "\t  availability: posts availability (online/offline)\n"
+            "\t  events: posts JSON event data, default \"<base>/events\"\n"
+            "\t  states: posts JSON state data, default \"<base>/states\"\n"
+            "\t  devices: posts device and sensor info in nested topics,\n"
+            "\t           default \"<base>/devices[/type][/model][/subtype][/channel][/id]\"\n"
+            "\tA base topic can be set with base=<topic>, default is \"rtl_433/HOSTNAME\".\n"
+            "\tAny topic string overrides the base topic and will expand keys like [/model]\n"
+            "\tE.g. -F \"mqtt://localhost:1883,user=USERNAME,pass=PASSWORD,retain=0,devices=rtl_433[/id]\"\n"
+            "\tFor TLS use e.g. -F \"mqtts://host,tls_cert=<path>,tls_key=<path>,tls_ca_cert=<path>\"\n"
+            "\tWith MQTT each rtl_433 instance needs a distinct driver selection. The MQTT Client-ID is computed from the driver string.\n"
+            "\tIf you use multiple RTL-SDR, perhaps set a serial and select by that (helps not to get the wrong antenna).\n"
+            "  [-F influx[:[//]host[:port][/<path and options>]]\n"
+            "\tSpecify InfluxDB 2.0 server with e.g. -F \"influx://localhost:9999/api/v2/write?org=<org>&bucket=<bucket>,token=<authtoken>\"\n"
+            "\tSpecify InfluxDB 1.x server with e.g. -F \"influx://localhost:8086/write?db=<db>&p=<password>&u=<user>\"\n"
+            "\t  Additional parameter -M time:unix:usec:utc for correct timestamps in InfluxDB recommended\n"
+            "  [-F syslog[:[//]host[:port] (default: localhost:514)\n"
+            "\tSpecify host/port for syslog with e.g. -F syslog:127.0.0.1:1514\n"
+            "  [-F trigger:/path/to/file]\n"
+            "\tAdd an output that writes a \"1\" to the path for each event, use with a e.g. a GPIO\n"
+            "  [-F rtl_tcp[:[//]bind[:port]] (default: localhost:1234)\n"
+            "\tAdd a rtl_tcp pass-through server\n"
+            "  [-F http[:[//]bind[:port]] (default: 0.0.0.0:8433)\n"
+            "\tAdd a HTTP API server, a UI is at e.g. http://localhost:8433/\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_tags(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Data tags option =\n"
+            "  [-K FILE | PATH | <tag> | <key>=<tag>] Add an expanded token or fixed tag to every output line.\n"
+            "\tIf <tag> is \"FILE\" or \"PATH\" an expanded token will be added.\n"
+            "\tThe <tag> can also be a GPSd URL, e.g.\n"
+            "\t\t\"-K gpsd,lat,lon\" (report lat and lon keys from local gpsd)\n"
+            "\t\t\"-K loc=gpsd,lat,lon\" (report lat and lon in loc object)\n"
+            "\t\t\"-K gpsd\" (full json TPV report, in default \"gps\" object)\n"
+            "\t\t\"-K foo=gpsd://127.0.0.1:2947\" (with key and address)\n"
+            "\t\t\"-K bar=gpsd,nmea\" (NMEA default GPGGA report)\n"
+            "\t\t\"-K rmc=gpsd,nmea,filter='$GPRMC'\" (NMEA GPRMC report)\n"
+            "\tAlso <tag> can be a generic tcp address, e.g.\n"
+            "\t\t\"-K foo=tcp:localhost:4000\" (read lines as TCP client)\n"
+            "\t\t\"-K bar=tcp://127.0.0.1:3000,init='subscribe tags\\r\\n'\"\n"
+            "\t\t\"-K baz=tcp://127.0.0.1:5000,filter='a prefix to match'\"\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_meta(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Meta information option =\n"
+            "  [-M time[:<options>]|protocol|level|noise[:<secs>]|stats|bits] Add various metadata to every output line.\n"
+            "\tUse \"time\" to add current date and time meta data (preset for live inputs).\n"
+            "\tUse \"time:rel\" to add sample position meta data (preset for read-file and stdin).\n"
+            "\tUse \"time:unix\" to show the seconds since unix epoch as time meta data. This is always UTC.\n"
+            "\tUse \"time:iso\" to show the time with ISO-8601 format (YYYY-MM-DD\"T\"hh:mm:ss).\n"
+            "\tUse \"time:off\" to remove time meta data.\n"
+            "\tUse \"time:usec\" to add microseconds to date time meta data.\n"
+            "\tUse \"time:tz\" to output time with timezone offset.\n"
+            "\tUse \"time:utc\" to output time in UTC.\n"
+            "\t\t(this may also be accomplished by invocation with TZ environment variable set).\n"
+            "\t\t\"usec\" and \"utc\" can be combined with other options, eg. \"time:iso:utc\" or \"time:unix:usec\".\n"
+            "\tUse \"replay[:N]\" to replay file inputs at (N-times) realtime.\n"
+            "\tUse \"protocol\" / \"noprotocol\" to output the decoder protocol number meta data.\n"
+            "\tUse \"level\" to add Modulation, Frequency, RSSI, SNR, and Noise meta data.\n"
+            "\tUse \"noise[:<secs>]\" to report estimated noise level at intervals (default: 10 seconds).\n"
+            "\tUse \"stats[:[<level>][:<interval>]]\" to report statistics (default: 600 seconds).\n"
+            "\t  level 0: no report, 1: report successful devices, 2: report active devices, 3: report all\n"
+            "\tUse \"bits\" to add bit representation to code outputs (for debug).\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_read(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Read file option =\n"
+            "  [-r <filename>] Read data from input file instead of a receiver\n"
+            "\tParameters are detected from the full path, file name, and extension.\n\n"
+            "\tA center frequency is detected as (fractional) number suffixed with 'M',\n"
+            "\t'Hz', 'kHz', 'MHz', or 'GHz'.\n\n"
+            "\tA sample rate is detected as (fractional) number suffixed with 'k',\n"
+            "\t'sps', 'ksps', 'Msps', or 'Gsps'.\n\n"
+            "\tFile content and format are detected as parameters, possible options are:\n"
+            "\t'cu8', 'cs16', 'cf32' ('IQ' implied), and 'am.s16'.\n\n"
+            "\tParameters must be separated by non-alphanumeric chars and are case-insensitive.\n"
+            "\tOverrides can be prefixed, separated by colon (':')\n\n"
+            "\tE.g. default detection by extension: path/filename.am.s16\n"
+            "\tforced overrides: am:s16:path/filename.ext\n\n"
+            "\tReading from pipes also support format options.\n"
+            "\tE.g reading complex 32-bit float: CU32:-\n");
+    exit(0);
+}
+
+_Noreturn
+static void help_write(void)
+{
+    term_help_fprintf(stdout,
+            "\t\t= Write file option =\n"
+            "  [-w <filename>] Save data stream to output file (a '-' dumps samples to stdout)\n"
+            "  [-W <filename>] Save data stream to output file, overwrite existing file\n"
+            "\tParameters are detected from the full path, file name, and extension.\n\n"
+            "\tFile content and format are detected as parameters, possible options are:\n"
+            "\t'cu8', 'cs8', 'cs16', 'cf32' ('IQ' implied),\n"
+            "\t'am.s16', 'am.f32', 'fm.s16', 'fm.f32',\n"
+            "\t'i.f32', 'q.f32', 'logic.u8', 'ook', and 'vcd'.\n\n"
+            "\tParameters must be separated by non-alphanumeric chars and are case-insensitive.\n"
+            "\tOverrides can be prefixed, separated by colon (':')\n\n"
+            "\tE.g. default detection by extension: path/filename.am.s16\n"
+            "\tforced overrides: am:s16:path/filename.ext\n");
+    exit(0);
+}
+
+static int hasopt(int test, int argc, char *argv[], char const *optstring)
+{
+    int opt;
+
+    optind = 1; // reset getopt
+    while ((opt = getopt(argc, argv, optstring)) != -1) {
+        if (opt == test || optopt == test)
+            return opt;
+    }
+    return 0;
+}
+
+static void parse_conf_option(r_cfg_t *cfg, int opt, char *arg);
+
+#define OPTSTRING "hVvqD:c:x:z:p:a:AI:S:m:M:r:w:W:l:d:t:f:H:g:s:b:n:R:X:F:K:C:T:UGy:E:Y:"
+
+// these should match the short options exactly
+static struct conf_keywords const conf_keywords[] = {
+        {"help", 'h'},
+        {"verbose", 'v'},
+        {"version", 'V'},
+        {"config_file", 'c'},
+        {"report_meta", 'M'},
+        {"device", 'd'},
+        {"device_mode", 'D'},
+        {"settings", 't'},
+        {"gain", 'g'},
+        {"frequency", 'f'},
+        {"hop_interval", 'H'},
+        {"ppm_error", 'p'},
+        {"sample_rate", 's'},
+        {"protocol", 'R'},
+        {"decoder", 'X'},
+        {"register_all", 'G'},
+        {"out_block_size", 'b'},
+        {"level_limit", 'l'},
+        {"samples_to_read", 'n'},
+        {"analyze", 'a'},
+        {"analyze_pulses", 'A'},
+        {"include_only", 'I'},
+        {"read_file", 'r'},
+        {"write_file", 'w'},
+        {"overwrite_file", 'W'},
+        {"signal_grabber", 'S'},
+        {"override_short", 'z'},
+        {"override_long", 'x'},
+        {"pulse_detect", 'Y'},
+        {"output", 'F'},
+        {"output_tag", 'K'},
+        {"convert", 'C'},
+        {"duration", 'T'},
+        {"test_data", 'y'},
+        {"stop_after_successful_events", 'E'},
+        {NULL, 0}};
+
+static void parse_conf_text(r_cfg_t *cfg, char *conf)
+{
+    int opt;
+    char *arg;
+    char *p = conf;
+
+    if (!conf || !*conf)
+        return;
+
+    while ((opt = getconf(&p, conf_keywords, &arg)) != -1) {
+        parse_conf_option(cfg, opt, arg);
+    }
+}
+
+static void parse_conf_file(r_cfg_t *cfg, char const *path)
+{
+    if (!path || !*path || !strcmp(path, "null") || !strcmp(path, "0"))
+        return;
+
+    char *conf = readconf(path);
+    parse_conf_text(cfg, conf);
+    //free(conf); // TODO: check no args are dangling, then use free
+}
+
+static void parse_conf_try_default_files(r_cfg_t *cfg)
+{
+    char **paths = compat_get_default_conf_paths();
+    for (int a = 0; paths[a]; a++) {
+        // fprintf(stderr, "Trying conf file at \"%s\"...\n", paths[a]);
+        if (hasconf(paths[a])) {
+            fprintf(stderr, "Reading conf from \"%s\".\n", paths[a]);
+            parse_conf_file(cfg, paths[a]);
+            break;
+        }
+    }
+}
+
+static void parse_conf_args(r_cfg_t *cfg, int argc, char *argv[])
+{
+    int opt;
+
+    optind = 1; // reset getopt
+    while ((opt = getopt(argc, argv, OPTSTRING)) != -1) {
+        if (opt == '?')
+            opt = optopt; // allow missing arguments
+        parse_conf_option(cfg, opt, optarg);
+    }
+}
+
+static void parse_conf_option(r_cfg_t *cfg, int opt, char *arg)
+{
+    int n;
+    r_device *flex_device;
+
+    if (arg && (!strcmp(arg, "help") || !strcmp(arg, "?"))) {
+        arg = NULL; // remove the arg if it's a request for the usage help
+    }
+
+    switch (opt) {
+    case 'h':
+        usage(0);
+        break;
+    case 'V':
+        exit(0); // we already printed the version
+        break;
+    case 'v':
+        if (!arg)
+            cfg->verbosity++;
+        else
+            cfg->verbosity = atobv(arg, 1);
+        break;
+    case 'c':
+        parse_conf_file(cfg, arg);
+        break;
+    case 'd':
+        if (!arg)
+            help_device_selection();
+
+        cfg->dev_query = arg;
+        break;
+    case 'D':
+        if (!arg)
+            help_device_mode();
+
+        if (strcmp(arg, "quit") == 0) {
+            cfg->dev_mode = DEVICE_MODE_QUIT;
+        }
+        else if (strcmp(arg, "restart") == 0) {
+            cfg->dev_mode = DEVICE_MODE_RESTART;
+        }
+        else if (strcmp(arg, "pause") == 0) {
+            cfg->dev_mode = DEVICE_MODE_PAUSE;
+        }
+        else if (strcmp(arg, "manual") == 0) {
+            cfg->dev_mode = DEVICE_MODE_MANUAL;
+        }
+        else {
+            fprintf(stderr, "Invalid input device run mode: %s\n", arg);
+            help_device_mode();
+        }
+        break;
+    case 't':
+        // this option changed, check and warn if old meaning is used
+        if (!arg || *arg == '-') {
+            fprintf(stderr, "test_mode (-t) is deprecated. Use -S none|all|unknown|known\n");
+            exit(1);
+        }
+        cfg->settings_str = arg;
+        break;
+    case 'f':
+        if (cfg->frequencies < MAX_FREQS) {
+            uint32_t sr = atouint32_metric(arg, "-f: ");
+            /* If the frequency is above 800MHz sample at 1MS/s */
+            if ((sr > FSK_PULSE_DETECTOR_LIMIT) && (cfg->samp_rate == DEFAULT_SAMPLE_RATE)) {
+                cfg->samp_rate = 1000000;
+                fprintf(stderr, "\nNew defaults active, use \"-Y classic -s 250k\" if you need the old defaults\n\n");
+            }
+            cfg->frequency[cfg->frequencies++] = sr;
+        } else
+            fprintf(stderr, "Max number of frequencies reached %d\n", MAX_FREQS);
+        break;
+    case 'H':
+        if (cfg->hop_times < MAX_FREQS)
+            cfg->hop_time[cfg->hop_times++] = atoi_time(arg, "-H: ");
+        else
+            fprintf(stderr, "Max number of hop times reached %d\n", MAX_FREQS);
+        break;
+    case 'g':
+        if (!arg)
+            help_gain();
+
+        free(cfg->gain_str);
+        cfg->gain_str = strdup(arg);
+        if (!cfg->gain_str)
+            FATAL_STRDUP("parse_conf_option()");
+        break;
+    case 'G':
+        fprintf(stderr, "register_all (-G) is deprecated. Use -R or a config file to enable additional protocols.\n");
+        exit(1);
+        break;
+    case 'p':
+        cfg->ppm_error = atobv(arg, 0);
+        break;
+    case 's':
+        cfg->samp_rate = atouint32_metric(arg, "-s: ");
+        break;
+    case 'b':
+        cfg->out_block_size = atouint32_metric(arg, "-b: ");
+        break;
+    case 'l':
+        n = 1000;
+        if (arg && atoi(arg) > 0)
+            n = atoi(arg);
+        fprintf(stderr, "\n\tLevel limit has changed from \"-l %d\" to \"-Y level=%.1f\" in dB.\n\n", n, AMP_TO_DB(n));
+        exit(1);
+        break;
+    case 'n':
+        cfg->bytes_to_read = atouint32_metric(arg, "-n: ") * 2;
+        break;
+    case 'a':
+        if (atobv(arg, 1) == 42 && !cfg->demod->am_analyze) {
+            cfg->demod->am_analyze = am_analyze_create();
+        }
+        else {
+            fprintf(stderr, "\n\tUse -a for testing only. Enable if you know how ;)\n\n");
+            exit(1);
+        }
+        break;
+    case 'A':
+        cfg->demod->analyze_pulses = atobv(arg, 1);
+        break;
+    case 'I':
+        fprintf(stderr, "include_only (-I) is deprecated. Use -S none|all|unknown|known\n");
+        exit(1);
+        break;
+    case 'r':
+        if (!arg)
+            help_read();
+
+        add_infile(cfg, arg);
+        // TODO: file_info_check_read()
+        break;
+    case 'w':
+        if (!arg)
+            help_write();
+
+        add_dumper(cfg, arg, 0);
+        break;
+    case 'W':
+        if (!arg)
+            help_write();
+
+        add_dumper(cfg, arg, 1);
+        break;
+    case 'S':
+        if (!arg)
+            usage(1);
+        if (strcasecmp(arg, "all") == 0)
+            cfg->grab_mode = 1;
+        else if (strcasecmp(arg, "unknown") == 0)
+            cfg->grab_mode = 2;
+        else if (strcasecmp(arg, "known") == 0)
+            cfg->grab_mode = 3;
+        else
+            cfg->grab_mode = atobv(arg, 1);
+        if (cfg->grab_mode && !cfg->demod->samp_grab)
+            cfg->demod->samp_grab = samp_grab_create(SIGNAL_GRABBER_BUFFER);
+        break;
+    case 'm':
+        fprintf(stderr, "sample mode option is deprecated.\n");
+        usage(1);
+        break;
+    case 'M':
+        if (!arg)
+            help_meta();
+
+        if (!strncasecmp(arg, "time", 4)) {
+            char *p = arg_param(arg);
+            // time  time:1  time:on  time:yes
+            // time:0  time:off  time:no
+            // time:rel
+            // time:unix
+            // time:iso
+            // time:...:usec  time:...:sec
+            // time:...:utc  time:...:local
+            cfg->report_time = REPORT_TIME_DATE;
+            while (p && *p) {
+                if (!strncasecmp(p, "0", 1) || !strncasecmp(p, "no", 2) || !strncasecmp(p, "off", 3))
+                    cfg->report_time = REPORT_TIME_OFF;
+                else if (!strncasecmp(p, "1", 1) || !strncasecmp(p, "yes", 3) || !strncasecmp(p, "on", 2))
+                    cfg->report_time = REPORT_TIME_DATE;
+                else if (!strncasecmp(p, "rel", 3))
+                    cfg->report_time = REPORT_TIME_SAMPLES;
+                else if (!strncasecmp(p, "unix", 4))
+                    cfg->report_time = REPORT_TIME_UNIX;
+                else if (!strncasecmp(p, "iso", 3))
+                    cfg->report_time = REPORT_TIME_ISO;
+                else if (!strncasecmp(p, "usec", 4))
+                    cfg->report_time_hires = 1;
+                else if (!strncasecmp(p, "sec", 3))
+                    cfg->report_time_hires = 0;
+                else if (!strncasecmp(p, "tz", 2))
+                    cfg->report_time_tz = 1;
+                else if (!strncasecmp(p, "notz", 4))
+                    cfg->report_time_tz = 0;
+                else if (!strncasecmp(p, "utc", 3))
+                    cfg->report_time_utc = 1;
+                else if (!strncasecmp(p, "local", 5))
+                    cfg->report_time_utc = 0;
+                else {
+                    fprintf(stderr, "Unknown time format option: %s\n", p);
+                    help_meta();
+                }
+
+                p = arg_param(p);
+            }
+            // fprintf(stderr, "time format: %d, usec:%d utc:%d\n", cfg->report_time, cfg->report_time_hires, cfg->report_time_utc);
+        }
+
+        // TODO: old time options, remove someday
+        else if (!strcasecmp(arg, "reltime"))
+            cfg->report_time = REPORT_TIME_SAMPLES;
+        else if (!strcasecmp(arg, "notime"))
+            cfg->report_time = REPORT_TIME_OFF;
+        else if (!strcasecmp(arg, "hires"))
+            cfg->report_time_hires = 1;
+        else if (!strcasecmp(arg, "utc"))
+            cfg->report_time_utc = 1;
+        else if (!strcasecmp(arg, "noutc"))
+            cfg->report_time_utc = 0;
+
+        else if (!strcasecmp(arg, "protocol"))
+            cfg->report_protocol = 1;
+        else if (!strcasecmp(arg, "noprotocol"))
+            cfg->report_protocol = 0;
+        else if (!strcasecmp(arg, "level"))
+            cfg->report_meta = 1;
+        else if (!strncasecmp(arg, "noise", 5))
+            cfg->report_noise = atoiv(arg_param(arg), 10); // atoi_time_default()
+        else if (!strcasecmp(arg, "bits"))
+            cfg->verbose_bits = 1;
+        else if (!strcasecmp(arg, "description"))
+            cfg->report_description = 1;
+        else if (!strcasecmp(arg, "newmodel"))
+            fprintf(stderr, "newmodel option (-M) is deprecated.\n");
+        else if (!strcasecmp(arg, "oldmodel"))
+            fprintf(stderr, "oldmodel option (-M) is deprecated.\n");
+        else if (!strncasecmp(arg, "stats", 5)) {
+            // there also should be options to set whether to flush on report
+            char *p = arg_param(arg);
+            cfg->report_stats = atoiv(p, 1);
+            cfg->stats_interval = atoiv(arg_param(p), 600); // atoi_time_default()
+            time(&cfg->stats_time);
+            cfg->stats_time += cfg->stats_interval;
+        }
+        else if (!strncasecmp(arg, "replay", 6))
+            cfg->in_replay = atobv(arg_param(arg), 1);
+        else
+            cfg->report_meta = atobv(arg, 1);
+        break;
+    case 'z':
+        fprintf(stderr, "override_short (-z) is deprecated.\n");
+        break;
+    case 'x':
+        fprintf(stderr, "override_long (-x) is deprecated.\n");
+        break;
+    case 'R':
+        if (!arg)
+            help_protocols(cfg->devices, cfg->num_r_devices, 0);
+
+        // use arg of 'v', 'vv', 'vvv' as global device verbosity
+        if (*arg == 'v') {
+            int decoder_verbosity = 0;
+            for (int i = 0; arg[i] == 'v'; ++i) {
+                decoder_verbosity += 1;
+            }
+            (void)decoder_verbosity; // FIXME: use this
+            break;
+        }
+
+        n = atoi(arg);
+        if (n > cfg->num_r_devices || -n > cfg->num_r_devices) {
+            fprintf(stderr, "Protocol number specified (%d) is larger than number of protocols\n\n", n);
+            help_protocols(cfg->devices, cfg->num_r_devices, 1);
+        }
+        if ((n > 0 && cfg->devices[n - 1].disabled > 2) || (n < 0 && cfg->devices[-n - 1].disabled > 2)) {
+            fprintf(stderr, "Protocol number specified (%d) is invalid\n\n", n);
+            help_protocols(cfg->devices, cfg->num_r_devices, 1);
+        }
+
+        if (n < 0 && !cfg->no_default_devices) {
+            register_all_protocols(cfg, 0); // register all defaults
+        }
+        cfg->no_default_devices = 1;
+
+        if (n >= 1) {
+            register_protocol(cfg, &cfg->devices[n - 1], arg_param(arg));
+        }
+        else if (n <= -1) {
+            unregister_protocol(cfg, &cfg->devices[-n - 1]);
+        }
+        else {
+            fprintf(stderr, "Disabling all device decoders.\n");
+            list_clear(&cfg->demod->r_devs, (list_elem_free_fn)free_protocol);
+        }
+        break;
+    case 'X':
+        if (!arg)
+            flex_create_device(NULL);
+
+        flex_device = flex_create_device(arg);
+        register_protocol(cfg, flex_device, "");
+        break;
+    case 'q':
+        fprintf(stderr, "quiet option (-q) is default and deprecated. See -v to increase verbosity\n");
+        break;
+    case 'F':
+        if (!arg)
+            help_output();
+
+        if (strncmp(arg, "json", 4) == 0) {
+            add_json_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "csv", 3) == 0) {
+            add_csv_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "log", 3) == 0) {
+            add_log_output(cfg, arg_param(arg));
+            cfg->has_logout = 1;
+        }
+        else if (strncmp(arg, "kv", 2) == 0) {
+            add_kv_output(cfg, arg_param(arg));
+            cfg->has_logout = 1;
+        }
+        else if (strncmp(arg, "mqtt", 4) == 0) {
+            add_mqtt_output(cfg, arg);
+        }
+        else if (strncmp(arg, "influx", 6) == 0) {
+            add_influx_output(cfg, arg);
+        }
+        else if (strncmp(arg, "syslog", 6) == 0) {
+            add_syslog_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "http", 4) == 0) {
+            add_http_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "trigger", 7) == 0) {
+            add_trigger_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "null", 4) == 0) {
+            add_null_output(cfg, arg_param(arg));
+        }
+        else if (strncmp(arg, "rtl_tcp", 7) == 0) {
+            add_rtltcp_output(cfg, arg_param(arg));
+        }
+        else {
+            fprintf(stderr, "Invalid output format: %s\n", arg);
+            usage(1);
+        }
+        break;
+    case 'K':
+        if (!arg)
+            help_tags();
+        add_data_tag(cfg, arg);
+        break;
+    case 'C':
+        if (!arg)
+            usage(1);
+        if (strcmp(arg, "native") == 0) {
+            cfg->conversion_mode = CONVERT_NATIVE;
+        }
+        else if (strcmp(arg, "si") == 0) {
+            cfg->conversion_mode = CONVERT_SI;
+        }
+        else if (strcmp(arg, "customary") == 0) {
+            cfg->conversion_mode = CONVERT_CUSTOMARY;
+        }
+        else {
+            fprintf(stderr, "Invalid conversion mode: %s\n", arg);
+            usage(1);
+        }
+        break;
+    case 'U':
+        fprintf(stderr, "UTC mode option (-U) is deprecated. Please use \"-M utc\".\n");
+        exit(1);
+        break;
+    case 'T':
+        cfg->duration = atoi_time(arg, "-T: ");
+        if (cfg->duration < 1) {
+            fprintf(stderr, "Duration '%s' not a positive number; will continue indefinitely\n", arg);
+        }
+        break;
+    case 'y':
+        cfg->test_data = arg;
+        break;
+    case 'Y':
+        if (!arg)
+            usage(1);
+        char const *p = arg;
+        while (p && *p) {
+            char const *val = NULL;
+            if (kwargs_match(p, "autolevel", &val))
+                cfg->demod->auto_level = atoiv(val, 1); // arg_float_default(p + 9, "-Y autolevel: ");
+            else if (kwargs_match(p, "squelch", &val))
+                cfg->demod->squelch_offset = atoiv(val, 1); // arg_float_default(p + 7, "-Y squelch: ");
+            else if (kwargs_match(p, "auto", &val))
+                cfg->fsk_pulse_detect_mode = FSK_PULSE_DETECT_AUTO;
+            else if (kwargs_match(p, "classic", &val))
+                cfg->fsk_pulse_detect_mode = FSK_PULSE_DETECT_OLD;
+            else if (kwargs_match(p, "minmax", &val))
+                cfg->fsk_pulse_detect_mode = FSK_PULSE_DETECT_NEW;
+            else if (kwargs_match(p, "ampest", &val))
+                cfg->demod->use_mag_est = 0;
+            else if (kwargs_match(p, "verbose", &val))
+                cfg->demod->detect_verbosity++;
+            else if (kwargs_match(p, "magest", &val))
+                cfg->demod->use_mag_est = 1;
+            else if (kwargs_match(p, "level", &val))
+                cfg->demod->level_limit = arg_float(val, "-Y level: ");
+            else if (kwargs_match(p, "minlevel", &val))
+                cfg->demod->min_level = arg_float(val, "-Y minlevel: ");
+            else if (kwargs_match(p, "minsnr", &val))
+                cfg->demod->min_snr = arg_float(val, "-Y minsnr: ");
+            else if (kwargs_match(p, "filter", &val))
+                cfg->demod->low_pass = arg_float(val, "-Y filter: ");
+            else {
+                fprintf(stderr, "Unknown pulse detector setting: %s\n", p);
+                usage(1);
+            }
+            p = kwargs_skip(p);
+        }
+        break;
+    case 'E':
+        if (arg && !strcmp(arg, "hop")) {
+            cfg->after_successful_events_flag = 2;
+        }
+        else if (arg && !strcmp(arg, "quit")) {
+            cfg->after_successful_events_flag = 1;
+        }
+        else {
+            cfg->after_successful_events_flag = atobv(arg, 1);
+        }
+        break;
+    default:
+        usage(1);
+        break;
+    }
+}
+
+static r_cfg_t g_cfg;
+
+// TODO: SIGINFO is not in POSIX...
+#ifndef SIGINFO
+#define SIGINFO 29
+#endif
+
+// NOTE: printf is not async safe per signal-safety(7)
+// writes a static string, without the terminating zero, to stderr, ignores return value
+#define write_err(s) (void)!write(STDERR_FILENO, (s), sizeof(s) - 1)
+
+#ifdef _WIN32
+BOOL WINAPI
+console_handler(int signum)
+{
+    if (CTRL_C_EVENT == signum) {
+        write_err("Signal caught, exiting!\n");
+        g_cfg.exit_async = 1;
+        // Uninstall handler, next Ctrl-C is a hard abort
+        SetConsoleCtrlHandler((PHANDLER_ROUTINE)console_handler, FALSE);
+        return TRUE;
+    }
+    else if (CTRL_BREAK_EVENT == signum) {
+        write_err("CTRL-BREAK detected, hopping to next frequency (-f). Use CTRL-C to quit.\n");
+        g_cfg.hop_now = 1;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+#else
+static void sighandler(int signum)
+{
+    if (signum == SIGPIPE) {
+        // NOTE: we already ignore most network SIGPIPE's, this might be a STDOUT/STDERR problem.
+        // Printing is likely not the correct way to handle this.
+        write_err("Signal SIGPIPE caught, broken pipe, exiting!\n");
+    }
+    else if (signum == SIGHUP) {
+        r_notify_sighup();
+        return;
+    }
+    else if (signum == SIGINFO/* TODO: maybe SIGUSR1 */) {
+        g_cfg.stats_now++;
+        return;
+    }
+    else if (signum == SIGUSR1) {
+        g_cfg.hop_now = 1;
+        return;
+    }
+    else {
+        write_err("Signal caught, exiting!\n");
+    }
+    g_cfg.exit_async = 1;
+
+    // Uninstall handler, next Ctrl-C is a hard abort
+    struct sigaction sigact;
+    sigact.sa_handler = NULL;
+    sigemptyset(&sigact.sa_mask);
+    sigact.sa_flags = 0;
+    sigaction(SIGINT, &sigact, NULL);
+    sigaction(SIGTERM, &sigact, NULL);
+    sigaction(SIGQUIT, &sigact, NULL);
+    sigaction(SIGPIPE, &sigact, NULL);
+}
+#endif
+
+int main(int argc, char **argv) {
+    int r = 0;
+    struct dm_state *demod;
+    r_cfg_t *cfg = &g_cfg;
+
+    print_version(); // always print the version info
+    sdr_redirect_logging();
+
+    r_init_cfg(cfg);
+
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    demod = cfg->demod;
+
+    // if there is no explicit conf file option look for default conf files
+    if (!hasopt('c', argc, argv, OPTSTRING)) {
+        parse_conf_try_default_files(cfg);
+    }
+
+    parse_conf_args(cfg, argc, argv);
+    // apply hop defaults and set first frequency
+    if (cfg->frequencies == 0) {
+        cfg->frequency[0] = DEFAULT_FREQUENCY;
+        cfg->frequencies  = 1;
+    }
+    cfg->center_frequency = cfg->frequency[cfg->frequency_index];
+    if (cfg->frequencies > 1 && cfg->hop_times == 0) {
+        cfg->hop_time[cfg->hop_times++] = DEFAULT_HOP_TIME;
+    }
+    // save sample rate, this should be a hop config too
+    uint32_t sample_rate_0 = cfg->samp_rate;
+
+    // add all remaining positional arguments as input files
+    while (argc > optind) {
+        add_infile(cfg, argv[optind++]);
+    }
+
+    pulse_detect_set_levels(demod->pulse_detect, demod->use_mag_est, demod->level_limit, demod->min_level, demod->min_snr, demod->detect_verbosity);
+
+    if (demod->am_analyze) {
+        demod->am_analyze->level_limit = DB_TO_AMP(demod->level_limit);
+        demod->am_analyze->frequency   = &cfg->center_frequency;
+        demod->am_analyze->samp_rate   = &cfg->samp_rate;
+        demod->am_analyze->sample_size = &demod->sample_size;
+    }
+
+    if (demod->samp_grab) {
+        demod->samp_grab->frequency   = &cfg->center_frequency;
+        demod->samp_grab->samp_rate   = &cfg->samp_rate;
+        demod->samp_grab->sample_size = &demod->sample_size;
+    }
+
+    if (cfg->report_time == REPORT_TIME_DEFAULT) {
+        if (cfg->in_files.len)
+            cfg->report_time = REPORT_TIME_SAMPLES;
+        else
+            cfg->report_time = REPORT_TIME_DATE;
+    }
+    if (cfg->report_time_utc) {
+#ifdef _WIN32
+        putenv("TZ=UTC+0");
+        _tzset();
+#else
+        r = setenv("TZ", "UTC", 1);
+        if (r != 0)
+            fprintf(stderr, "Unable to set TZ to UTC; error code: %d\n", r);
+#endif
+    }
+
+    if (!cfg->output_handler.len) {
+        add_kv_output(cfg, NULL);
+    }
+    else if (!cfg->has_logout) {
+        // Warn if no log outputs are enabled
+        fprintf(stderr, "Use \"-F log\" if you want any messages, warnings, and errors in the console.\n");
+    }
+    // Change log handler after outputs are set up
+    r_redirect_logging(cfg);
+
+    // register default decoders if nothing is configured
+    if (!cfg->no_default_devices) {
+        register_all_protocols(cfg, 0); // register all defaults
+    }
+
+    // check if we need FM demod
+    for (void **iter = demod->r_devs.elems; iter && *iter; ++iter) {
+        r_device *r_dev = *iter;
+        if (r_dev->modulation >= FSK_DEMOD_MIN_VAL) {
+            demod->enable_FM_demod = 1;
+            break;
+        }
+    }
+    // if any dumpers are requested the FM demod might be needed
+    if (cfg->demod->dumper.len) {
+        demod->enable_FM_demod = 1;
+    }
+
+    {
+        char decoders_str[1024];
+        decoders_str[0] = '\0';
+        if (cfg->verbosity <= LOG_NOTICE) {
+            abuf_t p = {0};
+            abuf_init(&p, decoders_str, sizeof(decoders_str));
+            // print registered decoder ranges
+            abuf_printf(&p, " [");
+            for (void **iter = demod->r_devs.elems; iter && *iter; ++iter) {
+                r_device *r_dev = *iter;
+                unsigned num = r_dev->protocol_num;
+                if (num == 0)
+                    continue;
+                while (iter[1]
+                        && r_dev->protocol_num + 1 == ((r_device *)iter[1])->protocol_num)
+                    r_dev = *++iter;
+                if (num == r_dev->protocol_num)
+                    abuf_printf(&p, " %u", num);
+                else
+                    abuf_printf(&p, " %u-%u", num, r_dev->protocol_num);
+            }
+            abuf_printf(&p, " ]");
+        }
+        print_logf(LOG_NOTICE, "Protocols", "Registered %zu out of %u device decoding protocols%s",
+                demod->r_devs.len, cfg->num_r_devices, decoders_str);
+    }
+
+    char const **well_known = well_known_output_fields(cfg);
+    start_outputs(cfg, well_known);
+    free((void *)well_known);
+
+    if (cfg->out_block_size < MINIMAL_BUF_LENGTH ||
+            cfg->out_block_size > MAXIMAL_BUF_LENGTH) {
+        print_logf(LOG_ERROR, "Block Size",
+                "Output block size wrong value, falling back to default (%d)", DEFAULT_BUF_LENGTH);
+        print_logf(LOG_ERROR, "Block Size",
+                "Minimal length: %d", MINIMAL_BUF_LENGTH);
+        print_logf(LOG_ERROR, "Block Size",
+                "Maximal length: %d", MAXIMAL_BUF_LENGTH);
+        cfg->out_block_size = DEFAULT_BUF_LENGTH;
+    }
+
+    // Special case for streaming test data
+    if (cfg->test_data && (!strcasecmp(cfg->test_data, "-") || *cfg->test_data == '@')) {
+        FILE *fp;
+        char line[INPUT_LINE_MAX];
+
+        if (*cfg->test_data == '@') {
+            print_logf(LOG_CRITICAL, "Input", "Reading test data from \"%s\"", &cfg->test_data[1]);
+            fp = fopen(&cfg->test_data[1], "r");
+        } else {
+            print_log(LOG_CRITICAL, "Input", "Reading test data from stdin");
+            fp = stdin;
+        }
+        if (!fp) {
+            print_logf(LOG_ERROR, "Input", "Failed to open %s", cfg->test_data);
+            exit(1);
+        }
+
+        while (fgets(line, INPUT_LINE_MAX, fp)) {
+            if (cfg->verbosity >= LOG_NOTICE)
+                print_logf(LOG_NOTICE, "Input", "Processing test data \"%s\"...", line);
+            r = 0;
+            // test a single decoder?
+            if (*line == '[') {
+                char *e = NULL;
+                unsigned d = (unsigned)strtol(&line[1], &e, 10);
+                if (!e || *e != ']') {
+                    print_logf(LOG_ERROR, "Protocol", "Bad protocol number %.5s.", line);
+                    exit(1);
+                }
+                e++;
+                r_device *r_dev = NULL;
+                for (void **iter = demod->r_devs.elems; iter && *iter; ++iter) {
+                    r_device *r_dev_i = *iter;
+                    if (r_dev_i->protocol_num == d) {
+                        r_dev = r_dev_i;
+                        break;
+                    }
+                }
+                if (!r_dev) {
+                    print_logf(LOG_ERROR, "Protocol", "Unknown protocol number %u.", d);
+                    exit(1);
+                }
+                if (cfg->verbosity >= LOG_NOTICE)
+                    print_logf(LOG_NOTICE, "Input", "Verifying test data with device %s.", r_dev->name);
+                if (rfraw_check(e)) {
+                    pulse_data_t pulse_data = {0};
+                    rfraw_parse(&pulse_data, e);
+                    list_t single_dev = {0};
+                    list_push(&single_dev, r_dev);
+                    if (!pulse_data.fsk_f2_est)
+                        r += run_ook_demods(&single_dev, &pulse_data);
+                    else
+                        r += run_fsk_demods(&single_dev, &pulse_data);
+                    list_free_elems(&single_dev, NULL);
+                } else
+                r += pulse_slicer_string(e, r_dev);
+                continue;
+            }
+            // otherwise test all decoders
+            if (rfraw_check(line)) {
+                pulse_data_t pulse_data = {0};
+                rfraw_parse(&pulse_data, line);
+                if (!pulse_data.fsk_f2_est)
+                    r += run_ook_demods(&demod->r_devs, &pulse_data);
+                else
+                    r += run_fsk_demods(&demod->r_devs, &pulse_data);
+            } else
+            for (void **iter = demod->r_devs.elems; iter && *iter; ++iter) {
+                r_device *r_dev = *iter;
+                if (cfg->verbosity >= LOG_NOTICE)
+                    print_logf(LOG_NOTICE, "Input", "Verifying test data with device %s.", r_dev->name);
+                r += pulse_slicer_string(line, r_dev);
+            }
+        }
+
+        if (*cfg->test_data == '@') {
+            fclose(fp);
+        }
+
+        r_free_cfg(cfg);
+        exit(!r);
+    }
+    // Special case for string test data
+    if (cfg->test_data) {
+        r = 0;
+        if (rfraw_check(cfg->test_data)) {
+            pulse_data_t pulse_data = {0};
+            rfraw_parse(&pulse_data, cfg->test_data);
+            if (!pulse_data.fsk_f2_est)
+                r += run_ook_demods(&demod->r_devs, &pulse_data);
+            else
+                r += run_fsk_demods(&demod->r_devs, &pulse_data);
+        } else
+        for (void **iter = demod->r_devs.elems; iter && *iter; ++iter) {
+            r_device *r_dev = *iter;
+            if (cfg->verbosity >= LOG_NOTICE)
+                print_logf(LOG_NOTICE, "Input", "Verifying test data with device %s.", r_dev->name);
+            r += pulse_slicer_string(cfg->test_data, r_dev);
+        }
+        r_free_cfg(cfg);
+        exit(!r);
+    }
+
+    // Special case for in files
+    if (cfg->in_files.len) {
+        unsigned char *test_mode_buf = malloc(DEFAULT_BUF_LENGTH * sizeof(unsigned char));
+        if (!test_mode_buf)
+            FATAL_MALLOC("test_mode_buf");
+        float *test_mode_float_buf = malloc(DEFAULT_BUF_LENGTH / sizeof(int16_t) * sizeof(float));
+        if (!test_mode_float_buf)
+            FATAL_MALLOC("test_mode_float_buf");
+
+        if (cfg->duration > 0) {
+            time(&cfg->stop_time);
+            cfg->stop_time += cfg->duration;
+        }
+
+        for (void **iter = cfg->in_files.elems; iter && *iter; ++iter) {
+            cfg->in_filename = *iter;
+
+            file_info_clear(&demod->load_info); // reset all info
+            file_info_parse_filename(&demod->load_info, cfg->in_filename);
+            // apply file info or default
+            cfg->samp_rate        = demod->load_info.sample_rate ? demod->load_info.sample_rate : sample_rate_0;
+            cfg->center_frequency = demod->load_info.center_frequency ? demod->load_info.center_frequency : cfg->frequency[0];
+
+            FILE *in_file;
+            if (strcmp(demod->load_info.path, "-") == 0) { // read samples from stdin
+                in_file = stdin;
+                cfg->in_filename = "<stdin>";
+            } else {
+                in_file = fopen(demod->load_info.path, "rb");
+                if (!in_file) {
+                    print_logf(LOG_ERROR, "Input", "Opening file \"%s\" failed!", cfg->in_filename);
+                    break;
+                }
+            }
+            print_logf(LOG_CRITICAL, "Input", "Test mode active. Reading samples from file: %s", cfg->in_filename); // Essential information (not quiet)
+            if (demod->load_info.format == CU8_IQ
+                    || demod->load_info.format == CS8_IQ
+                    || demod->load_info.format == S16_AM
+                    || demod->load_info.format == S16_FM) {
+                demod->sample_size = sizeof(uint8_t) * 2; // CU8, AM, FM
+            } else if (demod->load_info.format == CS16_IQ
+                    || demod->load_info.format == CF32_IQ) {
+                demod->sample_size = sizeof(int16_t) * 2; // CS16, CF32 (after conversion)
+            } else if (demod->load_info.format == PULSE_OOK) {
+                // ignore
+            } else {
+                print_logf(LOG_ERROR, "Input", "Input format invalid \"%s\"", file_info_string(&demod->load_info));
+                break;
+            }
+            if (cfg->verbosity >= LOG_NOTICE) {
+                print_logf(LOG_NOTICE, "Input", "Input format \"%s\"", file_info_string(&demod->load_info));
+            }
+            demod->sample_file_pos = 0.0;
+
+            // special case for pulse data file-inputs
+            if (demod->load_info.format == PULSE_OOK) {
+                while (!cfg->exit_async) {
+                    pulse_data_load(in_file, &demod->now, &demod->pulse_data, cfg->samp_rate);
+                    if (!demod->pulse_data.num_pulses)
+                        break;
+
+                    for (void **iter2 = demod->dumper.elems; iter2 && *iter2; ++iter2) {
+                        file_info_t const *dumper = *iter2;
+                        if (dumper->format == VCD_LOGIC) {
+                            pulse_data_print_vcd(dumper->file, &demod->pulse_data, '\'');
+                        } else if (dumper->format == PULSE_OOK) {
+                            pulse_data_dump(dumper->file, &demod->pulse_data);
+                        } else {
+                            print_logf(LOG_ERROR, "Input", "Dumper (%s) not supported on OOK input", dumper->spec);
+                            exit(1);
+                        }
+                    }
+
+                    if (demod->pulse_data.fsk_f2_est) {
+                        run_fsk_demods(&demod->r_devs, &demod->pulse_data);
+                    }
+                    else {
+                        int p_events = run_ook_demods(&demod->r_devs, &demod->pulse_data);
+                        if (cfg->verbosity >= LOG_DEBUG)
+                            pulse_data_print(&demod->pulse_data);
+                        if (demod->analyze_pulses && (cfg->grab_mode <= 1 || (cfg->grab_mode == 2 && p_events == 0) || (cfg->grab_mode == 3 && p_events > 0))) {
+                            r_device device = {.log_fn = log_device_handler, .output_ctx = cfg};
+                            pulse_analyzer(&demod->pulse_data, PULSE_DATA_OOK, &device);
+                        }
+                    }
+                }
+
+                if (in_file != stdin) {
+                    fclose(in_file);
+                }
+
+                continue;
+            }
+
+            // default case for file-inputs
+            int n_blocks = 0;
+            unsigned long n_read;
+            delay_timer_t delay_timer;
+            delay_timer_init(&delay_timer);
+            do {
+                // Replay in realtime if requested
+                if (cfg->in_replay) {
+                    // per block delay
+                    unsigned delay_us = (unsigned)(1000000llu * DEFAULT_BUF_LENGTH / cfg->samp_rate / demod->sample_size / cfg->in_replay);
+                    if (demod->load_info.format == CF32_IQ)
+                        delay_us /= 2; // adjust for float only reading half as many samples
+                    delay_timer_wait(&delay_timer, delay_us);
+                }
+                // Convert CF32 file to CS16 buffer
+                if (demod->load_info.format == CF32_IQ) {
+                    n_read = fread(test_mode_float_buf, sizeof(float), DEFAULT_BUF_LENGTH / 2, in_file);
+                    // clamp float to [-1,1] and scale to Q0.15
+                    for (unsigned long n = 0; n < n_read; n++) {
+                        int s_tmp = test_mode_float_buf[n] * INT16_MAX;
+                        if (s_tmp < -INT16_MAX)
+                            s_tmp = -INT16_MAX;
+                        else if (s_tmp > INT16_MAX)
+                            s_tmp = INT16_MAX;
+                        ((int16_t *)test_mode_buf)[n] = s_tmp;
+                    }
+                    n_read *= 2; // convert to byte count
+                } else {
+                    n_read = fread(test_mode_buf, 1, DEFAULT_BUF_LENGTH, in_file);
+
+                    // Convert CS8 file to CU8 buffer
+                    if (demod->load_info.format == CS8_IQ) {
+                        for (unsigned long n = 0; n < n_read; n++) {
+                            test_mode_buf[n] = ((int8_t)test_mode_buf[n]) + 128;
+                        }
+                    }
+                }
+                if (n_read == 0) break;  // sdr_callback() will Segmentation Fault with len=0
+                demod->sample_file_pos = ((float)n_blocks * DEFAULT_BUF_LENGTH + n_read) / cfg->samp_rate / demod->sample_size;
+                n_blocks++; // this assumes n_read == DEFAULT_BUF_LENGTH
+                r_process_buf(cfg, test_mode_buf, n_read);
+            } while (n_read != 0 && !cfg->exit_async);
+
+            // Call a last time with cleared samples to ensure EOP detection
+            if (demod->sample_size == 2) { // CU8
+                memset(test_mode_buf, 128, DEFAULT_BUF_LENGTH); // 128 is 0 in unsigned data
+                // or is 127.5 a better 0 in cu8 data?
+                //for (unsigned long n = 0; n < DEFAULT_BUF_LENGTH/2; n++)
+                //    ((uint16_t *)test_mode_buf)[n] = 0x807f;
+            }
+            else { // CF32, CS16
+                    memset(test_mode_buf, 0, DEFAULT_BUF_LENGTH);
+            }
+            demod->sample_file_pos = ((float)n_blocks + 1) * DEFAULT_BUF_LENGTH / cfg->samp_rate / demod->sample_size;
+            r_process_buf(cfg, test_mode_buf, DEFAULT_BUF_LENGTH);
+
+            //Always classify a signal at the end of the file
+            if (demod->am_analyze)
+                am_analyze_classify(demod->am_analyze);
+            if (cfg->verbosity >= LOG_NOTICE) {
+                print_logf(LOG_NOTICE, "Input", "Test mode file issued %d packets", n_blocks);
+            }
+            r_reset_callback(cfg);
+
+            if (in_file != stdin) {
+                fclose(in_file);
+            }
+        }
+
+        close_dumpers(cfg);
+        free(test_mode_buf);
+        free(test_mode_float_buf);
+        r_free_cfg(cfg);
+        exit(0);
+    }
+
+    // Normal case, no test data, no in files
+    if (cfg->sr_filename) {
+        print_logf(LOG_ERROR, "Input", "SR writing not recommended for live input");
+        exit(1);
+    }
+
+#ifndef _WIN32
+    struct sigaction sigact;
+    sigact.sa_handler = sighandler;
+    sigemptyset(&sigact.sa_mask);
+    sigact.sa_flags = 0;
+    sigaction(SIGHUP, &sigact, NULL);
+    sigaction(SIGINT, &sigact, NULL);
+    sigaction(SIGTERM, &sigact, NULL);
+    sigaction(SIGQUIT, &sigact, NULL);
+    sigaction(SIGPIPE, &sigact, NULL);
+    sigaction(SIGUSR1, &sigact, NULL);
+    sigaction(SIGINFO, &sigact, NULL);
+#else
+    SetConsoleCtrlHandler((PHANDLER_ROUTINE)console_handler, TRUE);
+#endif
+
+    // TODO: remove this before next release
+    print_log(LOG_NOTICE, "Input", "The internals of input handling changed, read about and report problems on PR #1978");
+
+    if (cfg->dev_mode != DEVICE_MODE_MANUAL) {
+        r = r_start(cfg);
+        if (r < 0) {
+            exit(2);
+        }
+    }
+
+    if (cfg->duration > 0) {
+        time(&cfg->stop_time);
+        cfg->stop_time += cfg->duration;
+    }
+
+    r_run(cfg);
+
+    if (cfg->report_stats > 0) {
+        event_occurred_handler(cfg, create_report_data(cfg, cfg->report_stats));
+        flush_report_data(cfg);
+    }
+
+    if (!cfg->exit_async) {
+        print_logf(LOG_ERROR, "rtl_433", "Library error %d, exiting...", r);
+        cfg->exit_code = r;
+    }
+
+    if (cfg->exit_code >= 0)
+        r = cfg->exit_code;
+    r_free_cfg(cfg);
+
+    return r >= 0 ? r : -r;
+}

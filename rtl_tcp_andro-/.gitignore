@@ -1,0 +1,12 @@
+*.iml
+.gradle
+/local.properties
+/.idea/workspace.xml
+/.idea/libraries
+.DS_Store
+/build
+/captures
+*/.cxx/
+*.aab
+/.idea/markdown-navigator.xml
+/.idea/markdown-navigator/profiles_settings.xml

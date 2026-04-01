@@ -1,0 +1,46 @@
+
+<resources>
+
+    <string name="app_name">Rtl-sdr driver</string>
+    <string name="sdr_tcp_exec">sdr_tcp</string>
+	<string name="help">Hjelp</string>
+	<string name="stream">Begynn strømmen</string>
+	<string name="kill">Full stopp</string>
+	<string name="args_hint">sdr_tcp-ledetekstargumenter</string>
+	<string name="default_args">-a 0.0.0.0 -p 14423 -f 91800000 -s 1024000</string>
+	<string name="copy">Kopier</string>
+	<string name="copied_to_clip">Utdataen ble kopiert til utklippstavlen</string>
+	<string name="clear">Tøm</string>
+	
+	<string name="error">Feil</string>
+	<string name="notsupported">Den påkrevde handlingen ble ikke iverksatt, fordi den ikke var tilgjengelig.</string>
+
+	<string name="choose_device">Enhetsvelger</string>
+	
+	<string name="btn_ok">OK</string>
+
+    <string name="license">Lisens</string>
+	<string name="help_info"> <![CDATA[
+	 
+	    <h2>Om denne appen</h2>
+	    <p>Denne appen er en port av rtl_tcp til Android-plattformen. Den gjør det mulig for andre apper å starte opp rtl_tcp og å bruke de uendrede I/Q-prøvene som den leser inn fra
+	    USB DVB-T-pinner basert på RTL2832U-chippen.</p>
+	    <p>Den gjør det også mulig for Android å strømme over nettverket direkte ifra driverens grensesnitt. Dette er en avansert egenskap og det kan være bugs i den.</p>
+		<h2>Bemerkninger og lisens</h2>
+		<p>Appen er for øyeblikket eksperimentell og kan være ustabil. Del gjerne dine opplevelser <a href="mailto:driver@sdrtouch.com">ved å sende meg en E-post</a>.</p>
+		<p>Denne appen er åpen-kildet og er lisensiert som GPL2+. Kildekoden kan bli sett hos <a href="https://github.com/martinmarinov/rtl_tcp_andro-">github.com/martinmarinov/rtl_tcp_andro-</a></p>
+		<p>For detaljert informasjon om lisensen, bruk Lisens-knappen.</p>
+		<h2>Inkludert åpen-kildet programvare</h2>
+		<p>En modifisert versjon av librtlsdr <a href="http://sdr.osmocom.org/trac/wiki/rtl-sdr">sdr.osmocom.org/trac/wiki/rtl-sdr</a></p>
+		<p>En modifisert versjon av libusb <a href="http://libusb.info/">libusb.info</a></p>
+		<p>En modifisert versjon av hackrf_android <a href="https://github.com/demantz/hackrf_android">github.com/demantz/hackrf_android</a></p>
+		<p>En modifisert versjon av libhackrf <a href="https://github.com/mossmann/hackrf/tree/master/host/libhackrf">github.com/mossmann/libhackrf</a></p>
+	]]></string>
+	
+	<string name="warn_txt">Driveren har blitt vellykket installert! Vennligst start opp din vertsapp og den vil sette i gang driveren automatisk.</string>
+    <string name="platform_not_supported">Din Android-plattform er ikke støttet. Vennligst ta kontakt med oss for å fortelle oss mer om enheten din, sånn at vi kan støtte den i fremtiden.</string>
+    <string name="enable_gui">Aktiver avansert modus (for avlusing og for strømming til PC)</string>
+
+	<string name="action_settings">Innstillinger</string>
+
+</resources>
